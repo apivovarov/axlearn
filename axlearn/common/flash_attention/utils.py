@@ -85,7 +85,7 @@ MultiHeadAttentionImpl = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tens
 
 
 def flash_attention_implementation(
-    backend: Literal["cpu", "tpu", "gpu", "xla"],
+    backend: Literal["cpu", "tpu", "gpu", "xla", "neuron"],
     *,
     softmax_scale: float,
     block_size: int = 128,
@@ -215,6 +215,14 @@ def flash_attention_implementation(
                 softmax_scale=softmax_scale,
                 block_size=block_size,
             )
+        
+        elif backend == "neuron":
+            from axlearn.common.flash_attention.neuron_attention import (
+                flash_attention as neuron_flash_attention,
+            )
+
+            return neuron_flash_attention(
+                query, key, value, causal, softmax_scale)
 
         elif backend in ("cpu", "xla"):
             if backend == "cpu":
