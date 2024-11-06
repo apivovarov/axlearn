@@ -142,10 +142,11 @@ class FlashAttention(GroupedQueryAttention):
             block_size=cfg.tpu_block_size,
         )
 
-        attention_logit_biases_spec = self._logit_biases_spec(attention_logit_biases)
-        attention_logit_biases = with_sharding_constraint(
-            attention_logit_biases, attention_logit_biases_spec
-        )
+        attention_logit_biases_spec = PartitionSpec(None, None, None, None)
+        # attention_logit_biases_spec = self._logit_biases_spec(attention_logit_biases)
+        # attention_logit_biases = with_sharding_constraint(
+        #     attention_logit_biases, attention_logit_biases_spec
+        # )
 
         # Scale query and key.
         q_proj = self.scale_query(q_proj)
