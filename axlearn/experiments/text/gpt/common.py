@@ -10,6 +10,7 @@ functions are used to build the args for `get_get_trainer_config_fn`, including 
 See c4_trainer.py for how they are used.
 """
 
+import os
 import math
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -33,6 +34,7 @@ from axlearn.common.attention import (
     FusedQKVLinear,
     MultiheadAttention,
     RepeatedTransformerLayer,
+    StackedTransformerLayer,
     TransformerLayer,
     build_remat_spec,
     set_double_shard_weights_config,
@@ -45,7 +47,7 @@ from axlearn.common.config import (
     maybe_instantiate,
     maybe_set_config,
 )
-from axlearn.common.decoder import Decoder
+from axlearn.common.decoder import Decoder, LmHead
 from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.evaler import BaseMetricCalculator, ModelSummaryAccumulator, SpmdEvaler
 from axlearn.common.evaler import every_n_steps_policy as eval_every_n_steps_policy
@@ -54,7 +56,7 @@ from axlearn.common.layers import BaseNormalizationLayer, set_bias_recursively, 
 from axlearn.common.param_init import PARAM_REGEXP_WEIGHT, DefaultInitializer, WeightInitializer
 from axlearn.common.summary_writer import BaseWriter
 from axlearn.common.trainer import MeshShape, SpmdTrainer
-from axlearn.common.utils import get_data_dir
+from axlearn.common.utils import get_data_dir, DataPartitionType
 from axlearn.experiments.text.common import DataMixtureComponent, tfds_text_source
 from axlearn.experiments.trainer_config_utils import TrainerConfigFn
 
@@ -64,7 +66,8 @@ EVAL_EVERY_N_STEPS = 5_000
 
 # We typically use bfloat16 as the step dtype,
 # (but usually keep parameters and optimizer state in float32).
-STEP_DTYPE = jnp.bfloat16
+STEP_DTYPE = jnp.float32 if os.environ.get('USE_FP32_COMPUTE') == '1' else jnp.bfloat16
+print(f"STEP_DTYPE: {STEP_DTYPE}")
 
 
 # The default mesh-axis names for LM training, from least to most communication intensive.
@@ -233,7 +236,7 @@ def model_config(
         layer_cfg.self_attention.attention.input_linear = attention_qkv_linear
     layer_cfg.self_attention.structure = atten_structure
     layer_cfg.self_attention.attention.atten_logit_cap = atten_logit_cap
-    if stack_cfg.klass is RepeatedTransformerLayer:
+    if stack_cfg.klass is RepeatedTransformerLayer or stack_cfg.klass is StackedTransformerLayer:
         if layer_cfg.self_attention.attention.klass is not FlashAttention:
             # Enable remat to reduce memory usage for larger models.
             layer_cfg.remat_spec = build_remat_spec(stack_cfg)
@@ -272,11 +275,15 @@ def model_config(
     set_double_shard_weights_config(
         cfg.decoder.transformer.layer,
         batch_axis_names=batch_axis_names,
-        fsdp_axis_names=("expert", "fsdp", "seq"),
+        fsdp_axis_names=("data"),
         tp_axis_names="model",
         seq_axis_names=("seq",),
     )
-    cfg.decoder.logits_partition_spec = (batch_axis_names, "seq", "model")
+
+    tp_axis_names='model'
+    fsdp_axis_names='data'
+    cfg.decoder.emb.token_emb.param_partition_spec = (tp_axis_names, fsdp_axis_names) # shard vocab
+
     set_bias_recursively(cfg, False)
     set_norm_recursively(cfg, normalization)
     cfg.z_loss_scale = z_loss_scale
@@ -293,6 +300,8 @@ def learner_config(
     b1: float = 0.9,
     b2: float = 0.95,
     eps: float = 1e-8,
+    gradient_accumulation_microbatches: int = 1,
+    metrics_accumulation_key_ops: Dict = {}
 ) -> learner.Learner.Config:
     """Build learner using the AdamW optimizer and a cosine lr schedule with linear warmup."""
     update_schedule = config_for_function(schedule.cosine_with_linear_warmup).set(
@@ -315,10 +324,14 @@ def learner_config(
                 weight_decay=weight_decay,
                 weight_decay_per_param_scale=None,
                 adam_update_transformation=None,
+                mu_dtype=jnp.float32,
             ),
         ]
     )
-    return learner.Learner.default_config().set(optimizer=optimizer_cfg)
+    if gradient_accumulation_microbatches > 1:
+        return learner.AccumulatedLearner.default_config().set(optimizer=optimizer_cfg, microbatches=gradient_accumulation_microbatches, metrics_accumulation_key_ops=metrics_accumulation_key_ops)
+    else:
+        return learner.Learner.default_config().set(optimizer=optimizer_cfg)
 
 
 def tfds_read_config() -> InstantiableConfig:
@@ -496,6 +509,7 @@ def get_trainer_config_fn(
     train_batch_size: int,
     mesh_shape: Sequence[int],
     train_input_source: InstantiableConfig[input_tf_data.BuildDatasetFn],
+    input_partition_type: DataPartitionType,
     evalers: Dict[str, SpmdEvaler.Config],
     mesh_axis_names: Sequence[str] = MESH_AXIS_NAMES,
     mesh_rules: Optional[Sequence[Tuple[str, Optional[MeshShape]]]] = None,
@@ -548,6 +562,7 @@ def get_trainer_config_fn(
                 pad_example_fn=input_tf_data.default_pad_example_fn,
             ),
         )
+        cfg.input_partition_type = input_partition_type
         cfg.evalers = {}
         for name, evaler_cfg in evalers.items():
             evaler_cfg.input.batcher.set(global_batch_size=eval_batch_size or train_batch_size)
@@ -561,7 +576,7 @@ def get_trainer_config_fn(
         )
         cfg.checkpointer.keep_every_n_steps = min(max_step, keep_every_n_steps)
         cfg.checkpointer.keep_last_n = 3
-        cfg.summary_writer.write_every_n_steps = min(eval_every_n_steps, 100)
+        cfg.summary_writer.write_every_n_steps = min(eval_every_n_steps, 10)
         if mesh_shape:
             assert len(mesh_axis_names) == len(
                 mesh_shape

@@ -9,6 +9,7 @@ The fuji models are set up to imitate LLaMA models:
 * LLaMA 2: https://arxiv.org/abs/2307.09288
 * LLaMA 3: https://github.com/meta-llama/llama3
 """
+import os
 import enum
 from typing import Any, Dict, Optional, Union
 
@@ -19,6 +20,7 @@ from axlearn.common.attention import (
     GroupedQueryAttention,
     MultiheadAttention,
     RepeatedTransformerLayer,
+    StackedTransformerLayer,
     RoFormerQKVLinear,
 )
 from axlearn.common.embedding import TransformerTextEmbeddings
@@ -31,6 +33,12 @@ from axlearn.experiments.text.gpt.common import (
 )
 from axlearn.experiments.text.gpt.common import model_config as common_model_config
 from axlearn.experiments.text.gpt.common import scaled_hidden_dim
+from axlearn.common.utils import DataPartitionType
+from axlearn.common.learner import GeometricMeanStrategy, AddStrategy
+import jax
+import os
+
+# jax._src.interpreters.mlir._platforms_with_donation.append('neuron')
 
 MODEL_SIZES = ("test", "7B", "70B")
 
@@ -43,7 +51,7 @@ class Version(enum.Enum):
 
 # Mapping from Fuji versions to vocab sizes.
 VOCAB_SIZE = {
-    Version.V1: 32 * 1024,
+    Version.V1: 128 * 1024,
     Version.V2: 32 * 1024,
     Version.V3: 128 * 1024,
 }
@@ -57,8 +65,13 @@ MAX_SEQUENCE_LENGTH = {
 }
 
 
+TP_DEGREE = int(os.environ.get('TP_DEGREE', '64'))
+TRN_MODEL_AXIS_SIZE = TP_DEGREE
+
+GRADIENT_ACCUMULATION_MICROBATCHES=1
+
 ROPE_THETA = {
-    Version.V1: 1e4,
+    Version.V1: 5e5,
     Version.V2: 1e4,
     Version.V3: 5e5,
 }
@@ -89,10 +102,11 @@ def get_trainer_kwargs(
     *,
     vocab_size: int,
     version: Version,
-    flash_attention: bool = False,
+    flash_attention: bool = True,
 ) -> Dict[str, Any]:
     """Construct default trainer kwargs given a model size."""
-    tokens_per_batch = 4 * (1024**2)  # 4M tokens.
+    # tokens_per_batch = 4 * (1024**2)  # 4M tokens.
+    tokens_per_batch = MAX_SEQUENCE_LENGTH[version] # one sequence per batch
     max_step = TOTAL_TOKENS[version][model_size] // tokens_per_batch
     max_sequence_length = MAX_SEQUENCE_LENGTH[version]
     train_batch_size = tokens_per_batch // max_sequence_length
@@ -122,29 +136,33 @@ def get_trainer_kwargs(
                 peak_lr=6e-4,
                 weight_decay=0.01,
             ),
+            input_partition_type=DataPartitionType.DATA,
             max_sequence_length=64,
             train_batch_size=32,
-            eval_batch_size=32,
             max_step=3000,
             eval_every_n_steps=1500,
             save_every_n_steps=500,
             mesh_shape=mesh_shape_from_axes(data=-1),
+            eval_batch_size=int(jax.device_count()/TRN_MODEL_AXIS_SIZE),
         )
     elif model_size == "7B":
         trainer_kwargs = dict(
             model_kwargs=dict(
-                num_layers=32,
-                hidden_dim=128 * 32,
-                num_heads=32,
-                num_kv_heads=num_kv_heads,
+                num_layers=10,
+                hidden_dim=8192,
+                ffn_dim=scaled_hidden_dim(scale=4, round_up_to_multiples_of=16),
+                num_heads=64,
+                num_kv_heads=None,
                 rope_theta=rope_theta,
                 flash_attention=flash_attention,
             ),
             learner_kwargs=dict(peak_lr=3e-4, weight_decay=0.1),
+            input_partition_type=DataPartitionType.DATA,
+            # 1 batch per DP replica
+            train_batch_size=int((jax.device_count()/TRN_MODEL_AXIS_SIZE)*GRADIENT_ACCUMULATION_MICROBATCHES),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
-            max_step=max_step,
-            mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
+            max_step=500_000,  # 2T tokens // 4M tokens/step.
+            mesh_shape=mesh_shape_from_axes(data=-1, model=TRN_MODEL_AXIS_SIZE),
             mesh_rules=(
                 # Step time:
                 # v1 on tpu-v4-1024 (512 chips):            3.03s
@@ -167,23 +185,30 @@ def get_trainer_kwargs(
                     "gpu-(p5.48xlarge|p4de.24xlarge)-(256|512|1024)",
                     mesh_shape_from_axes(data=-1, fsdp=8),
                 ),
+                (   
+                    "trn2",
+                    mesh_shape_from_axes(data=-1, model=TRN_MODEL_AXIS_SIZE),
+                ),
             ),
+            eval_batch_size=int(jax.device_count()/TRN_MODEL_AXIS_SIZE),
+            eval_every_n_steps=5000,
         )
     elif model_size == "70B":
         trainer_kwargs = dict(
             model_kwargs=dict(
-                num_layers=80,
+                num_layers=int(os.environ.get('N_LAYERS', 4)),
                 hidden_dim=128 * 64,
                 num_heads=64,
                 # No GQA support in V1 models, so num_kv_heads is the same as num_heads.
-                num_kv_heads=None if version == Version.V1 else 8,
+                num_kv_heads=None, #if version == Version.V1 else 8,
                 rope_theta=rope_theta,
                 flash_attention=flash_attention,
             ),
             learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
-            max_step=max_step,
+            input_partition_type=DataPartitionType.DATA,
+            train_batch_size=int((jax.device_count()/TRN_MODEL_AXIS_SIZE)*GRADIENT_ACCUMULATION_MICROBATCHES),
+            max_step=500000,
             mesh_shape=mesh_shape_from_axes(fsdp=-1),
             mesh_rules=(
                 # tpu-v5e. step time: TBD.
@@ -194,7 +219,48 @@ def get_trainer_kwargs(
                     "gpu-(p5.48xlarge|p4de.24xlarge)-(512|1024)",
                     mesh_shape_from_axes(data=-1, fsdp=128),
                 ),
+                (   
+                    "trn2",
+                    mesh_shape_from_axes(data=-1, model=TRN_MODEL_AXIS_SIZE),
+                ),
             ),
+            eval_batch_size=int(jax.device_count()/TRN_MODEL_AXIS_SIZE),
+            eval_every_n_steps=500_000,
+        )
+    elif model_size == "405B":
+        trainer_kwargs = dict(
+            model_kwargs=dict(
+                num_layers=int(os.environ.get('N_LAYERS', 4)),
+                hidden_dim=16384,
+                ffn_dim=53248,
+                num_heads=128,
+                # No GQA support in V1 models, so num_kv_heads is the same as num_heads.
+                num_kv_heads=None, #if version == Version.V1 else 8,
+                rope_theta=rope_theta,
+                flash_attention=flash_attention,
+            ),
+            learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=0.1),
+            max_sequence_length=8192,
+            input_partition_type=DataPartitionType.DATA,
+            train_batch_size=int((jax.device_count()/TRN_MODEL_AXIS_SIZE)*GRADIENT_ACCUMULATION_MICROBATCHES),
+            max_step=500000,
+            mesh_shape=mesh_shape_from_axes(fsdp=-1),
+            mesh_rules=(
+                # tpu-v5e. step time: TBD.
+                ("tpu-v5litepod-256", mesh_shape_from_axes(data=-1, fsdp=256)),
+                # H100/A100 80G. Maximum per-node batch size = 16, hence need >= 64 nodes.
+                # v2 on gpu-p5.48xlarge 8x64, step time: 12.9s.
+                (
+                    "gpu-(p5.48xlarge|p4de.24xlarge)-(512|1024)",
+                    mesh_shape_from_axes(data=-1, fsdp=128),
+                ),
+                (   
+                    "trn2",
+                    mesh_shape_from_axes(data=-1, model=TRN_MODEL_AXIS_SIZE),
+                ),
+            ),
+            eval_batch_size=int(jax.device_count()/TRN_MODEL_AXIS_SIZE),
+            eval_every_n_steps=500_000,
         )
     else:
         raise NotImplementedError(f"Unknown model size {model_size}.")
@@ -203,6 +269,8 @@ def get_trainer_kwargs(
     trainer_kwargs["model_cfg"] = model_config(**model_kwargs)
     trainer_kwargs["learner_cfg"] = learner_config(
         max_step=trainer_kwargs["max_step"],
+        gradient_accumulation_microbatches=GRADIENT_ACCUMULATION_MICROBATCHES,
+        metrics_accumulation_key_ops={".output_collection.summaries['bits_per_byte'].mean": AddStrategy},
         **trainer_kwargs.pop("learner_kwargs"),
     )
     # pylint: enable=use-dict-literal
@@ -219,7 +287,7 @@ def model_config(
     rope_theta: float,
     dropout_rate: float = 0.0,
     ffn_dim: Optional[Union[int, config.FunctionConfigBase]] = None,
-    flash_attention: bool = False,
+    flash_attention: bool = True,
 ) -> causal_lm.Model.Config:
     """Returns an LM model config based on the given hyperparams.
 
@@ -262,7 +330,7 @@ def model_config(
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         vocab_size=vocab_size,
-        stack_cfg=RepeatedTransformerLayer.default_config(),
+        stack_cfg=StackedTransformerLayer.default_config(),
         activation_fn=activation_fn,
         ffn_dim=ffn_dim,
         normalization=RMSNorm.default_config().set(eps=1e-5, forward_dtype=None),
