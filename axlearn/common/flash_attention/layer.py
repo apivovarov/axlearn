@@ -208,9 +208,10 @@ class FlashAttention(GroupedQueryAttention):
                 cfg.mha_dim_to_partition_spec["bsnh"],
                 cfg.mha_dim_to_partition_spec["bsnh"],
                 # Bias [batch_size, num_heads, seq_len, seq_len].
-                cfg.mha_dim_to_partition_spec["bnts"],
+                # cfg.mha_dim_to_partition_spec["bnts"],
                 # Segment IDs [batch_size, seq_len].
                 segment_ids_spec,
+                PartitionSpec(None, None, None, None)
             ),
             # O [batch_size, seq_len, num_heads, per_head_dim].
             out_specs=cfg.mha_dim_to_partition_spec["btnh"],
@@ -240,9 +241,9 @@ class FlashAttention(GroupedQueryAttention):
             attention_logit_biases = jnp.broadcast_to(
                 attention_logit_biases, (batch, num_heads, target_len, source_len)
             )
-            attention_logit_biases = with_sharding_constraint(
-                attention_logit_biases, cfg.mha_dim_to_partition_spec["bnts"]
-            )
+            # attention_logit_biases = with_sharding_constraint(
+            #     attention_logit_biases, cfg.mha_dim_to_partition_spec["bnts"]
+            # )
         if segment_ids is not None:
             if segment_ids.shape[0] != q_proj.shape[0]:
                 raise ValueError(
