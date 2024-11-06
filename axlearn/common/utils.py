@@ -7,7 +7,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 """Common utilities."""
-
 import collections
 import contextlib
 import copy
@@ -35,9 +34,11 @@ from typing import (
     Union,
 )
 
+import flax.struct
 import jax
 import numpy as np
 from absl import logging
+from flax import serialization
 from jax import numpy as jnp
 from jax._src.tree_util import KeyEntry, KeyPath
 from jax.experimental import maps, mesh_utils, multihost_utils
@@ -248,7 +249,7 @@ class VDict(dict):
         return cls(zip(keys, values))
 
 
-# Register VDict as a dict for serialization.
+# Register VDict as a dict for Flax serialization.
 serialization.register_serialization_state(
     VDict,
     # pylint: disable-next=protected-access
@@ -522,21 +523,6 @@ def complete_partition_spec_tree(
     return jax.tree_util.tree_unflatten(treedef, axes)
 
 
-def input_partition_spec() -> PartitionSpec:
-    """Returns partition spec for the input batch.
-
-    We partition the inputs along all axes. For example, if the mesh has shape (64, 4) and axis
-    names of ("data", "model"), the partition spec will be (("data", "model"), None...) so that the
-    batch axis of every global tensor will be partitioned 256 (= 64 * 4) ways.
-
-    Must be called within the context of a Mesh.
-    """
-    mesh = maps.thread_resources.env.physical_mesh
-    return PartitionSpec(
-        mesh.axis_names,
-    )
-
-
 # Key associated with per-example dataset dispatch index tensor, indicating which logical
 # batch index the example maps to.
 PHYSICAL_TO_LOGICAL_DISPATCH_KEY = "__physical_to_logical_batch_dispatch"
@@ -586,14 +572,35 @@ class DataPartitionType(Enum):
     FULL = "full"
     # Data are fully replicated across all devices.
     REPLICATED = "replicated"
+    # Data are partially partitioned across rank of data
+    DATA = "data"
 
 
-def data_partition_type_to_spec(partition: DataPartitionType) -> PartitionSpec:
+def input_partition_spec(partition: DataPartitionType = DataPartitionType.FULL) -> PartitionSpec:
+    """Returns partition spec for the input batch.
+
+    We partition the inputs along all axes. For example, if the mesh has shape (64, 4) and axis
+    names of ("data", "model"), the partition spec will be (("data", "model"), None...) so that the
+    batch axis of every global tensor will be partitioned 256 (= 64 * 4) ways.
+
+    Must be called within the context of a Mesh.
+    """
+    if partition == DataPartitionType.FULL:
+        mesh = maps.thread_resources.env.physical_mesh
+        return PartitionSpec(
+            mesh.axis_names,
+        )
+    elif partition == DataPartitionType.DATA:
+        return PartitionSpec('data')
+
+def data_partition_type_to_spec(partition: DataPartitionType = DataPartitionType.FULL) -> PartitionSpec:
     """Returns a PartitionSpec for the given partition type."""
     if partition == DataPartitionType.FULL:
-        return input_partition_spec()
+        return input_partition_spec(partition)
     elif partition == DataPartitionType.REPLICATED:
         return None
+    elif partition == DataPartitionType.DATA:
+        return input_partition_spec(partition) 
     else:
         raise NotImplementedError(f"Unsupported partition: {partition}")
 
@@ -633,6 +640,18 @@ def host_to_global_device_array(
         # np.reshape is faster than np.split, jnp.reshape, and jnp.split.
         xs = np.reshape(x, (len_local_devices, x.shape[0] // len_local_devices, *x.shape[1:]))
         return [jax.device_put(x_i, device) for x_i, device in zip(xs, local_devices)]
+    
+    def put_to_devices_data_partitioned(x: Tensor) -> List[Tensor]:
+        # data is sharded across the rank of data axis
+        data_axis = mesh.axis_names.index('data') 
+        data_dimension = mesh.device_ids.shape[data_axis]
+
+        if x.shape[0] % data_dimension != 0:
+            raise ValueError(f"({x.shape}) cannot be sharded across {data_dimension} data axis.") 
+
+        sharding = jax.sharding.NamedSharding(mesh, partition_spec)
+        return [jax.device_put(x[index] if isinstance(x[index], np.ndarray) else x[index].numpy(), d)
+                for d, index in sharding.addressable_devices_indices_map(x.shape).items()]
 
     def put_to_devices_replicated(x: Tensor) -> List[Tensor]:
         # Replicate `x` to every local device.
@@ -642,6 +661,8 @@ def host_to_global_device_array(
         put_to_devices = put_to_devices_fully_partitioned
     elif partition == DataPartitionType.REPLICATED:
         put_to_devices = put_to_devices_replicated
+    elif partition == DataPartitionType.DATA:
+        put_to_devices = put_to_devices_data_partitioned
     else:
         raise NotImplementedError(f"Unsupported partition: {partition}")
 
@@ -655,6 +676,8 @@ def host_to_global_device_array(
         if partition == DataPartitionType.FULL:
             global_batch_size = x.shape[0] * jax.process_count()
         elif partition == DataPartitionType.REPLICATED:
+            global_batch_size = x.shape[0]
+        elif partition == DataPartitionType.DATA:
             global_batch_size = x.shape[0]
         else:
             raise NotImplementedError(f"Unsupported partition: {partition}")
@@ -1242,6 +1265,10 @@ def create_device_mesh(
         and mesh_shape[0] % num_granules != 0
     ):
         logging.warning("Falling back to ICI-only mesh on GPU, performance may be reduced.")
+        return build_standard_mesh(mesh_shape, devices=devices)
+
+    # Neuron also only uses standard mesh 
+    if device_platform == "neuron":
         return build_standard_mesh(mesh_shape, devices=devices)
 
     # Canonicalize to HybridMeshShape. If DCN mesh is not specified, break the first non-singleton

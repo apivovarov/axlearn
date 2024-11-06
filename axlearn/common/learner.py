@@ -8,9 +8,10 @@
 """
 from __future__ import annotations
 
+import os
 import dataclasses
 import enum
-from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple, cast
 
 import jax
 import optax
@@ -377,6 +378,32 @@ def _apply_updates(base: Nested[Tensor], updates: Nested[Tensor]) -> Nested[Tens
         else:
             base[k] = _apply_updates(base[k], v)
     return base
+
+class MetricsAccumulationOp(NamedTuple):
+    microbatches: int
+
+    def aggregrate(self, x, buffer):
+        raise NotImplementedError(self)
+    def normalize(self, buffer):
+        raise NotImplementedError(self)
+
+class ArithmeticMeanStrategy(MetricsAccumulationOp):
+    def aggregrate(self, x, buffer):
+        return buffer + x
+    def normalize(self, buffer):
+        return buffer / self.microbatches
+
+class GeometricMeanStrategy(MetricsAccumulationOp):
+    def aggregrate(self, x, buffer):
+        return buffer * x
+    def normalize(self, buffer):
+        return buffer ** (-self.microbatches)
+
+class AddStrategy(MetricsAccumulationOp):
+    def aggregrate(self, x, buffer):
+        return buffer + x
+    def normalize(self, buffer):
+        return buffer
 
 
 class CompositeLearner(BaseLearner):

@@ -164,7 +164,8 @@ class FlashAttention(GroupedQueryAttention):
                 cfg.mha_dim_to_partition_spec["bsnh"],
                 cfg.mha_dim_to_partition_spec["bsnh"],
                 # Bias [batch_size, num_heads, seq_len, seq_len].
-                cfg.mha_dim_to_partition_spec["bnts"],
+                # cfg.mha_dim_to_partition_spec["bnts"],
+                PartitionSpec(None, None, None, None)
             ),
             # O [batch_size, seq_len, num_heads, per_head_dim].
             out_specs=cfg.mha_dim_to_partition_spec["btnh"],
@@ -187,9 +188,9 @@ class FlashAttention(GroupedQueryAttention):
                     "attention_logit_biases must have matching batch dim: "
                     f"{attention_logit_biases.shape} vs. {q_proj.shape[0]}"
                 )
-            attention_logit_biases = with_sharding_constraint(
-                attention_logit_biases, cfg.mha_dim_to_partition_spec["bnts"]
-            )
+            # attention_logit_biases = with_sharding_constraint(
+            #     attention_logit_biases, cfg.mha_dim_to_partition_spec["bnts"]
+            # )
 
         outputs = with_sharding_constraint(
             partitioned_mha(

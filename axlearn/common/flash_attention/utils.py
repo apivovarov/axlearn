@@ -77,7 +77,7 @@ MultiHeadAttentionImpl = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
 
 
 def flash_attention_implementation(
-    backend: Literal["cpu", "tpu", "gpu", "xla"],
+    backend: Literal["cpu", "tpu", "gpu", "xla", "neuron"],
     *,
     causal: bool,
     softmax_scale: float,
@@ -144,6 +144,19 @@ def flash_attention_implementation(
                 block_sizes=block_sizes,
             )
             return context
+
+        return jit_attn
+
+    elif backend == "neuron":
+        from axlearn.common.flash_attention.neuron_attention import (
+            flash_attention as neuron_flash_attention,
+        )
+
+        # shard_map-decorated function needs to be jitted.
+        @jax.jit
+        def jit_attn(query, key, value, bias):
+            return neuron_flash_attention(
+                query, key, value, causal, softmax_scale)
 
         return jit_attn
 
